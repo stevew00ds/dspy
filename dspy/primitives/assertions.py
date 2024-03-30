@@ -1,9 +1,10 @@
 import inspect
-from typing import Any, Callable
-import dsp
-import dspy
 import logging
 import uuid
+from typing import Any
+
+import dsp
+import dspy
 
 #################### Assertion Helpers ####################
 
@@ -16,7 +17,7 @@ def setup_logger():
     fileHandler.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     fileHandler.setFormatter(formatter)
 
@@ -40,11 +41,17 @@ class DSPyAssertionError(AssertionError):
     """Custom exception raised when a DSPy `Assert` fails."""
 
     def __init__(
-        self, id: str, msg: str, state: Any = None, is_metric: bool = False
+        self,
+        id: str,
+        msg: str,
+        target_module: Any = None,
+        state: Any = None,
+        is_metric: bool = False,
     ) -> None:
         super().__init__(msg)
         self.id = id
         self.msg = msg
+        self.target_module = target_module
         self.state = state
         self.is_metric = is_metric
 
@@ -72,8 +79,9 @@ class DSPySuggestionError(AssertionError):
 
 
 class Constraint:
+
     def __init__(
-        self, result: bool, msg: str = "", target_module=None, is_metric: bool = False
+        self, result: bool, msg: str = "", target_module=None, is_metric: bool = False,
     ):
         self.id = str(uuid.uuid4())
         self.result = result
@@ -99,6 +107,7 @@ class Assert(Constraint):
                 raise DSPyAssertionError(
                     id=self.id,
                     msg=self.msg,
+                    target_module=self.target_module,
                     state=dsp.settings.trace,
                     is_metric=self.is_metric,
                 )
@@ -179,7 +188,7 @@ def assert_no_except_handler(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except DSPyAssertionError as e:
+        except DSPyAssertionError:
             return None
 
     return wrapper
@@ -208,7 +217,7 @@ def backtrack_handler(func, bypass_suggest=True, max_backtracks=2):
                 if i > 0 and dspy.settings.backtrack_to is not None:
                     # generate values for new fields
                     feedback_msg = _build_error_msg(
-                        dspy.settings.predictor_feedbacks[dspy.settings.backtrack_to]
+                        dspy.settings.predictor_feedbacks[dspy.settings.backtrack_to],
                     )
 
                     dspy.settings.backtrack_to_args = {
@@ -230,13 +239,12 @@ def backtrack_handler(func, bypass_suggest=True, max_backtracks=2):
                 else:
                     try:
                         dsp.settings.trace.clear()
-                        # print("backtrack", dspy.settings.backtrack_to)
                         result = func(*args, **kwargs)
                         break
                     except (DSPySuggestionError, DSPyAssertionError) as e:
                         if not current_error:
                             current_error = e
-                        suggest_id, error_msg, suggest_target_module, error_state = (
+                        error_id, error_msg, error_target_module, error_state = (
                             e.id,
                             e.msg,
                             e.target_module,
@@ -250,11 +258,11 @@ def backtrack_handler(func, bypass_suggest=True, max_backtracks=2):
                             dspy.settings.assert_failures += 1
 
                         if dsp.settings.trace:
-                            if suggest_target_module:
+                            if error_target_module:
                                 for i in range(len(dsp.settings.trace) - 1, -1, -1):
                                     trace_element = dsp.settings.trace[i]
                                     mod = trace_element[0]
-                                    if mod.signature == suggest_target_module:
+                                    if mod.signature == error_target_module:
                                         dspy.settings.backtrack_to = mod
                                         break
                             else:
@@ -267,20 +275,20 @@ def backtrack_handler(func, bypass_suggest=True, max_backtracks=2):
                             if (
                                 error_msg
                                 not in dspy.settings.predictor_feedbacks.setdefault(
-                                    dspy.settings.backtrack_to, []
+                                    dspy.settings.backtrack_to, [],
                                 )
                             ):
                                 dspy.settings.predictor_feedbacks[
                                     dspy.settings.backtrack_to
                                 ].append(error_msg)
 
-                            output_fields = vars(error_state[0].signature.signature)
+                            # assert isinstance(error_state[0].signature, dspy.Signature)
+                            output_fields = error_state[0].signature.output_fields
                             past_outputs = {}
-                            for field_name, field_obj in output_fields.items():
-                                if isinstance(field_obj, dspy.OutputField):
-                                    past_outputs[field_name] = getattr(
-                                        error_state[2], field_name, None
-                                    )
+                            for field_name in output_fields.keys():
+                                past_outputs[field_name] = getattr(
+                                    error_state[2], field_name, None,
+                                )
 
                             # save latest failure trace for predictor per suggestion
                             error_ip = error_state[1]
@@ -290,7 +298,7 @@ def backtrack_handler(func, bypass_suggest=True, max_backtracks=2):
 
                         else:
                             logger.error(
-                                f"UNREACHABLE: No trace available, this should not happen. Is this run time?"
+                                "UNREACHABLE: No trace available, this should not happen. Is this run time?",
                             )
 
             return result
@@ -316,33 +324,37 @@ default_assertion_handler = backtrack_handler
 
 
 def assert_transform_module(
-    module, assertion_handler=default_assertion_handler, **handler_args
+    module, assertion_handler=default_assertion_handler, **handler_args,
 ):
     """
     Transform a module to handle assertions.
     """
     if not getattr(module, "forward", False):
         raise ValueError(
-            "Module must have a forward method to have assertions handled."
+            "Module must have a forward method to have assertions handled.",
         )
     if getattr(module, "_forward", False):
         logger.info(
-            f"Module {module.__class__.__name__} already has a _forward method. Skipping..."
+            f"Module {module.__class__.__name__} already has a _forward method. Skipping...",
         )
         pass  # TODO warning: might be overwriting a previous _forward method
 
     module._forward = module.forward
     module.forward = handle_assert_forward(assertion_handler, **handler_args).__get__(
-        module
+        module,
     )
 
-    if all(map(lambda p: isinstance(p[1], dspy.retry.Retry), module.named_predictors())):
-        pass # we already applied the Retry mapping outside
-    elif all(map(lambda p: not isinstance(p[1], dspy.retry.Retry), module.named_predictors())):
+    if all(
+        map(lambda p: isinstance(p[1], dspy.retry.Retry), module.named_predictors()),
+    ):
+        pass  # we already applied the Retry mapping outside
+    elif all(
+        map(lambda p: not isinstance(p[1], dspy.retry.Retry), module.named_predictors()),
+    ):
         module.map_named_predictors(dspy.retry.Retry)
     else:
         raise RuntimeError("Module has mixed predictors, can't apply Retry mapping.")
 
-    setattr(module, "_assert_transformed", True)
+    module._assert_transformed = True
 
     return module
